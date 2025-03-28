@@ -10,7 +10,6 @@ import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.LinkedList;
-import java.util.Map;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 import org.jooq.exception.DataAccessException;
@@ -29,6 +28,8 @@ public class CloudFormationCustomResource extends AbstractCustomResourceHandler 
 
     // Initialize the Log4j logger.
     Logger log = LogManager.getLogger();
+    
+    private final static String RESOURCE_ID = "db_sql_initialize";
 
     @Override
     protected Response create(CloudFormationCustomResourceEvent cfcre, Context cntxt) {
@@ -66,7 +67,8 @@ public class CloudFormationCustomResource extends AbstractCustomResourceHandler 
             log.error("Could Not Process SQL Files", e);
         }
         return Response.builder()
-                .value(Map.of("dboperations", "success"))
+                .reason("SQL files applied to database")
+                .physicalResourceId(RESOURCE_ID)
                 .build();
     }
 
@@ -79,7 +81,10 @@ public class CloudFormationCustomResource extends AbstractCustomResourceHandler 
     @Override
     protected Response update(CloudFormationCustomResourceEvent cfcre, Context cntxt) {
         log.debug("Received UPDATE Event from Cloudformation", cfcre);
-        return null;
+        return Response.builder()
+                .physicalResourceId(RESOURCE_ID)
+                .reason("UPDATE event ignored")
+                .build();
     }
 
     /**
@@ -91,7 +96,10 @@ public class CloudFormationCustomResource extends AbstractCustomResourceHandler 
     @Override
     protected Response delete(CloudFormationCustomResourceEvent cfcre, Context cntxt) {
         log.debug("Received DELETE Event from Cloudformation", cfcre);
-        return null;
+        return Response.builder()
+                .physicalResourceId(RESOURCE_ID)
+                .reason("DELETE event ignored")
+                .build();
     }
 
 }
