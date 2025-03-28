@@ -37,8 +37,13 @@ jobs:
     - name: SAM Build
       run: sam build
       
-    - name: Validate SAM Template
-      run:  sam validate --lint
+    - name: Setup Cloud Formation Linter with Latest Version
+      uses: scottbrenner/cfn-lint-action@v2
+
+    - name: Print the Cloud Formation Linter Version & run Linter.
+      run: |
+        cfn-lint --version
+        cfn-lint -t ./template.yaml
     
 
 
