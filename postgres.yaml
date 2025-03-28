@@ -68,7 +68,7 @@ Resources:
     Properties:
       Engine: aurora-postgresql
       Port: 5432
-      EngineVersion: '15.8'
+      EngineVersion: '15.10'
       DatabaseName: !Ref DBNAMEPARAM
       ManageMasterUserPassword: true
       MasterUsername: !Ref DBUSERPARAM
