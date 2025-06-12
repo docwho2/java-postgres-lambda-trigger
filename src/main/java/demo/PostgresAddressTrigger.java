@@ -9,10 +9,7 @@ import static demo.PostgresAbstractTrigger.TG_OP.INSERT;
 import java.util.Objects;
 import org.jooq.JSONB;
 import org.jooq.impl.DSL;
-import software.amazon.awssdk.auth.credentials.EnvironmentVariableCredentialsProvider;
-import software.amazon.awssdk.core.SdkSystemSetting;
-import software.amazon.awssdk.http.urlconnection.UrlConnectionHttpClient;
-import software.amazon.awssdk.regions.Region;
+import software.amazon.awssdk.http.crt.AwsCrtHttpClient;
 import software.amazon.awssdk.services.location.LocationClient;
 import software.amazon.awssdk.services.location.model.SearchPlaceIndexForTextResponse;
 
@@ -28,9 +25,7 @@ public class PostgresAddressTrigger extends PostgresAbstractTrigger {
 
     static {
         locationClient = LocationClient.builder()
-                .region(Region.of(System.getenv(SdkSystemSetting.AWS_REGION.environmentVariable())))
-                .credentialsProvider(EnvironmentVariableCredentialsProvider.create())
-                .httpClient(UrlConnectionHttpClient.builder().build())
+                .httpClient(AwsCrtHttpClient.builder().build())
                 .build();
 
         PLACE_INDEX = System.getenv("PLACE_INDEX");
