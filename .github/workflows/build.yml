@@ -28,22 +28,16 @@ jobs:
       uses: aws-actions/setup-sam@v2
       with:
         use-installer: true
-
-    - name: Setup AWS SAM
-      uses: aws-actions/setup-sam@v2
-      with:
-        use-installer: true
         
     - name: SAM Build
       run: sam build
       
-    - name: Setup Cloud Formation Linter with Latest Version
+    - name: Install and run cfn-lint
       uses: scottbrenner/cfn-lint-action@v2
+      with:
+          command: cfn-lint -t ./template.yml
 
-    - name: Print the Cloud Formation Linter Version & run Linter.
-      run: |
-        cfn-lint --version
-        cfn-lint -t ./template.yaml
+   
     
 
 
