@@ -42,13 +42,13 @@ The Serverless Application Model Command Line Interface (SAM CLI) is an extensio
 To use the SAM CLI, you need the following tools.
 
 * SAM CLI - [Install the SAM CLI](https://docs.aws.amazon.com/serverless-application-model/latest/developerguide/serverless-sam-cli-install.html)
-* Java21 - [Install the Java 21](https://docs.aws.amazon.com/corretto/latest/corretto-21-ug/downloads-list.html)
+* Java25 - [Install the Java 25](https://docs.aws.amazon.com/corretto/latest/corretto-25-ug/downloads-list.html)
 * Maven - [Install Maven](https://maven.apache.org/install.html)
 
 If you have brew installed then
 ```bash
 brew install aws-sam-cli
-brew install corretto@21
+brew install corretto@25
 brew install maven
 ```
 
