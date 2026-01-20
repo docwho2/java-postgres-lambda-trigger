@@ -20,9 +20,10 @@ Globals:
         DB_MASTER_SECRET_ARN: !GetAtt RDSStack.Outputs.SecretArn
         DB_ENDPOINT: !GetAtt RDSStack.Outputs.Endpoint
         DB_NAME: !Ref DBNAMEPARAM
+        JAVA_TOOL_OPTIONS: -XX:+UseShenandoahGC -XX:ShenandoahGCMode=generational
     CodeUri: .
     Architectures:
-        - arm64         # SnapStart now supports arm
+        - arm64
     Runtime: java25
     Timeout: 30
     MemorySize: 3009
