@@ -3,10 +3,30 @@ package demo;
 import org.jooq.impl.DSL;
 
 /**
- * Handler for requests to Lambda function.
+ * Handles the {@code /multiple} UI action by inserting five fixed sample addresses.
+ *
+ * <p>All inserts share one transaction to demonstrate how asynchronous database-trigger
+ * invocations can begin before their source rows become visible to another connection.
+ * The inherited handler redirects only after the transaction call returns.
  */
 public class CreateMultipleAddressFrontEnd extends AbstractActionFrontEnd {
 
+    /**
+     * Creates the batch-address action; the transaction starts only when the action is invoked.
+     */
+    public CreateMultipleAddressFrontEnd() {
+    }
+
+    /**
+     * Inserts the Microsoft, Tesla, SpaceX, State Farm, and Delta sample addresses in
+     * one transaction, with numbered notes identifying the five rows in the UI.
+     *
+     * <p>A failed insert rolls back the transaction. Lambda invocations initiated by the
+     * database triggers are external effects and are not undone by that database rollback.
+     *
+     * @throws org.jooq.exception.DataAccessException if database access or the transaction
+     *         fails; the inherited handler converts the failure to an HTTP 500 response
+     */
     @Override
     protected void performAction() {
         // Insert 5 addresses in one transaction so they all hit at once

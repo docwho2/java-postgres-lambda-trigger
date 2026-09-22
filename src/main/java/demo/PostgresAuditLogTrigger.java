@@ -1,35 +1,35 @@
-/*
- * Click nbfs://nbhost/SystemFileSystem/Templates/Licenses/license-default.txt to change this license
- * Click nbfs://nbhost/SystemFileSystem/Templates/Classes/Class.java to edit this template
- */
 package demo;
 
 import com.fasterxml.jackson.databind.JsonNode;
 import org.jooq.JSONB;
 import org.jooq.impl.DSL;
 
-/*
- * Audit log trigger that takes incoming event and writes to audit log table
-
-  CREATE TABLE IF NOT EXISTS audit_log (
-    id BIGSERIAL PRIMARY KEY,
-    created timestamp without time zone NOT NULL DEFAULT timezone('utc'::text, now()),
-    operation tg_op NOT NULL,
-    table text NOT NULL,
-    old_record jsonb,
-    new_record jsonb
-);
- * 
+/**
+ * Records directly delivered PostgreSQL row-change events in {@code audit_log}.
+ *
+ * <p>Each invocation stores the operation, source table name, and available before/after
+ * row images. Identity and creation time come from table defaults. Inserts are not deduplicated,
+ * so repeated delivery can create repeated audit entries. The source address row is not modified.
+ *
  * @author sjensen
  */
 public class PostgresAuditLogTrigger extends PostgresAbstractTrigger {
 
     /**
+     * Creates the direct-audit handler; an audit connection is opened when an event is processed.
+     */
+    public PostgresAuditLogTrigger() {
+    }
+
+    /**
+     * Inserts one audit row, converting missing or JSON-null row images to SQL NULL.
      *
-     * @param operation
-     * @param table_name
-     * @param old_record
-     * @param new_record
+     * @param operation PostgreSQL INSERT, UPDATE, or DELETE operation stored as text
+     * @param table_name source table name stored in the {@code table_name} column
+     * @param old_record pre-change image, or Java/JSON null when no old image exists
+     * @param new_record post-change image, or Java/JSON null when no new image exists
+     * @throws org.jooq.exception.DataAccessException if the insert fails; the base stream
+     *         handler logs and suppresses this failure under its current acknowledgement policy
      */
     @Override
     protected void processEvent(TG_OP operation, String table_name, JsonNode old_record, JsonNode new_record) {

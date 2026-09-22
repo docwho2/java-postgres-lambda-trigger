@@ -1,7 +1,3 @@
-/*
- * Click nbfs://nbhost/SystemFileSystem/Templates/Licenses/license-default.txt to change this license
- * Click nbfs://nbhost/SystemFileSystem/Templates/Classes/Class.java to edit this template
- */
 package demo;
 
 import com.fasterxml.jackson.databind.JsonNode;
@@ -14,13 +10,26 @@ import software.amazon.awssdk.services.location.LocationClient;
 import software.amazon.awssdk.services.location.model.SearchPlaceIndexForTextResponse;
 
 /**
- * Geo Code Addresses that are added to the address table
+ * Geocodes address row changes with Amazon Location Service and persists the best match.
+ *
+ * <p>The database trigger selects INSERT/UPDATE rows whose {@code requires_geo_coding} flag
+ * is true. This handler geocodes inserts and updates that change {@code address_1}; changing
+ * only the city, district, or postal code does not cause a lookup here. A successful lookup
+ * clears the flag to prevent the geocoding update from invoking this handler recursively.
  *
  * @author sjensen
  */
 public class PostgresAddressTrigger extends PostgresAbstractTrigger {
 
+    /**
+     * Creates the geocoding handler after class initialization has prepared the shared Location client.
+     */
+    public PostgresAddressTrigger() {
+    }
+
+    /** Amazon Location client initialized once per execution environment and reused for lookups. */
     static final LocationClient locationClient;
+    /** Place-index name read from the SAM-provided {@code PLACE_INDEX} environment variable. */
     static final String PLACE_INDEX;
 
     static {
@@ -31,6 +40,21 @@ public class PostgresAddressTrigger extends PostgresAbstractTrigger {
         PLACE_INDEX = System.getenv("PLACE_INDEX");
     }
 
+    /**
+     * Determines whether an address event requires a lookup and geocodes it when needed.
+     *
+     * <p>INSERT always triggers a lookup. Other operations compare {@code address_1} in the
+     * two images; callers are expected to send UPDATE in that branch. DELETE is not supported
+     * by this address handler and is excluded by its database trigger. The geocoding flag is
+     * checked by the SQL trigger, not by this method.
+     *
+     * @param operation expected INSERT or UPDATE operation from the address trigger
+     * @param table_name source table name; unused because this handler always updates {@code address}
+     * @param old_addr previous address image for UPDATE; unused for INSERT
+     * @param new_addr current address image containing the ID and address fields to geocode
+     * @throws org.jooq.exception.DataAccessException if persisting a geocoding result fails
+     * @throws software.amazon.awssdk.core.exception.SdkException if the Location lookup fails
+     */
     @Override
     protected void processEvent(TG_OP operation, String table_name, JsonNode old_addr, JsonNode new_addr) {
 
@@ -59,6 +83,24 @@ public class PostgresAddressTrigger extends PostgresAbstractTrigger {
 
     }
 
+    /**
+     * Looks up one address and writes the first Location result back to its source row.
+     *
+     * <p>The search uses street, city, district, and an optional postal code. A match stores
+     * the formatted address, timestamp, longitude/latitude, and response JSON, and clears
+     * {@code requires_geo_coding}. With no match, the row and flag remain unchanged.
+     *
+     * <p>An update affecting zero rows is retried with linearly increasing sleeps of
+     * 100 milliseconds, allowing time for the originating transaction to commit. This loop
+     * has no explicit attempt/deadline limit and ignores interruption; a missing or rolled-back
+     * row can keep it running until the Lambda timeout or another failure terminates execution.
+     *
+     * @param addr address row image with {@code id}, {@code address_1}, {@code city},
+     *             {@code district}, and a {@code postal_code} field that may contain JSON null
+     * @throws org.jooq.exception.DataAccessException if the database update fails
+     * @throws software.amazon.awssdk.core.exception.SdkException if the Location lookup fails
+     * @throws NullPointerException if a required JSON field is absent
+     */
     private void geoCodeAddress(JsonNode addr) {
         // Build address String
         final var address = new StringBuilder(addr.findValue("address_1").asText());

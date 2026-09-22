@@ -1,7 +1,3 @@
-/*
- * Click nbfs://nbhost/SystemFileSystem/Templates/Licenses/license-default.txt to change this license
- * Click nbfs://nbhost/SystemFileSystem/Templates/Classes/Class.java to edit this template
- */
 package demo;
 
 import com.amazonaws.services.lambda.runtime.Context;
@@ -14,28 +10,44 @@ import org.jooq.DSLContext;
 import org.jooq.JSONB;
 import org.jooq.impl.DSL;
 
-/*
- * Audit log trigger that takes incoming event and writes to audit log table
-
-  CREATE TABLE IF NOT EXISTS audit_log_sqs (
-    id BIGSERIAL PRIMARY KEY,
-    created timestamp without time zone NOT NULL DEFAULT timezone('utc'::text, now()),
-    operation tg_op NOT NULL,
-    table text NOT NULL,
-    old_record jsonb,
-    new_record jsonb
-);
- * 
- * Receive the SQS payload for Audit log entry
+/**
+ * Records PostgreSQL row-change payloads delivered through SQS in {@code audit_log_sqs}.
+ *
+ * <p>The forwarding Lambda places the original trigger JSON in each message body. This
+ * consumer processes only the first record, matching the SAM event source's batch size of one.
+ * It holds a database context for the execution environment's lifetime and does not deduplicate
+ * messages. Processing exceptions are logged and suppressed, so returning normally can acknowledge
+ * a message whose audit insert failed.
  */
 public class PostgresAuditLogTriggerSQS implements RequestHandler<SQSEvent, Void> {
 
+    /**
+     * Creates the queue consumer after class initialization has opened the shared database context.
+     */
+    public PostgresAuditLogTriggerSQS() {
+    }
+
+    /** Logger for queue payloads, empty message bodies, and processing failures. */
     final Logger log = LogManager.getLogger();
 
+    /** Database context opened during class initialization and reused across invocations. */
     final static DSLContext dsl = PostgresDataSource.getDSL();
 
+    /** Shared mapper used to parse the original PostgreSQL trigger JSON from message bodies. */
     final static ObjectMapper mapper = new ObjectMapper();
 
+    /**
+     * Parses the first SQS message and inserts its operation and row images into the audit table.
+     *
+     * <p>Empty bodies are logged and skipped. Other parsing or database exceptions inside
+     * the method are logged and suppressed. Additional records in a larger batch would be
+     * ignored, so the event source must retain its batch size of one. This handler does not
+     * return partial batch failures or throw processing errors for SQS retries.
+     *
+     * @param event SQS event expected to contain exactly one record with PostgreSQL trigger JSON
+     * @param context Lambda invocation metadata; unused by this implementation
+     * @return always {@code null}, including when a message is skipped or processing fails
+     */
     @Override
     public Void handleRequest(SQSEvent event, Context context) {
         try {
