@@ -24,6 +24,32 @@ Other goals of the project:
 - To simply provide a full working example with Java and AWS RDS Postgres (what I use day to day).  The Demo on the AWS Website is MySQL with NodeJS and there was nothing I could find that really showed a full use case in Java.
 
 
+## Web UI Lambda
+
+All five UI routes use the existing `FrontEnd` Lambda (`${AWS::StackName}-DemoFrontEnd`),
+with `demo.WebHandler` dispatching to the existing Java implementations:
+
+| Method | Path | Behavior |
+| --- | --- | --- |
+| GET | `/` | Display the tables |
+| GET | `/create` | Add one address, then redirect to `/` |
+| GET | `/multiple` | Add five addresses, then redirect to `/` |
+| GET | `/delete` | Delete the last address, then redirect to `/` |
+| GET | `/audit` | Clear both audit tables, then redirect to `/` |
+
+The routes share one set of warm execution environments and one SnapStart alias.
+Calls between the router and action classes are ordinary Java calls. SAM explicitly
+uses HTTP API payload format `1.0` to match `APIGatewayProxyRequestEvent`.
+Actual latency improvement depends on traffic and needs measurement after deployment.
+
+The database trigger, SQS forwarding/consumer, and database setup Lambdas remain separate.
+Updating an existing stack removes the four former action Lambdas and their log groups
+(the log groups retain their existing `DeletionPolicy: Delete`). UI logs then go to
+`/aws/lambda/${AWS::StackName}-DemoFrontEnd`. URLs, HTML, database operations, and
+successful action redirects (`307`, `Location: /`) remain the same.
+
+Run the offline routing and action-response tests with `mvn clean test` before `sam build`.
+
 ## Contents
 This project contains source code and supporting files for a serverless application that you can deploy with the SAM CLI. It includes the following files and folders.
 
@@ -97,6 +123,9 @@ java-postgres-lambda-trigger$ sam delete
 ```
 
 ## Sample Deploy Output
+
+Historical output from the original deployment, before the UI Lambdas were consolidated.
+
 ```bash
 java-postgres-lambda-trigger$ sam deploy
 

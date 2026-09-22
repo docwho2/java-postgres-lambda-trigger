@@ -50,12 +50,12 @@ Resources:
     DependsOn: FrontEndLogGroup
     Properties:
       FunctionName: !Sub ${AWS::StackName}-DemoFrontEnd
-      Description: Displays Sample Postgres Table and allows Address Entry
-      Handler: demo.FrontEnd
+      Description: Displays the demo UI and handles all address and audit actions
+      Handler: demo.WebHandler
       AutoPublishAlias: SNAPSTART
       SnapStart:
         ApplyOn: PublishedVersions
-      Policies: 
+      Policies:
         - !Ref SecretsPolicy
       Events:
         HelloWorld:
@@ -64,7 +64,36 @@ Resources:
             Path: /
             Method: get
             ApiId: !Ref ApiGateway
-            
+            PayloadFormatVersion: '1.0'
+        CreateAddress:
+          Type: HttpApi
+          Properties:
+            Path: /create
+            Method: get
+            ApiId: !Ref ApiGateway
+            PayloadFormatVersion: '1.0'
+        MultipleAddress:
+          Type: HttpApi
+          Properties:
+            Path: /multiple
+            Method: get
+            ApiId: !Ref ApiGateway
+            PayloadFormatVersion: '1.0'
+        DeleteAddress:
+          Type: HttpApi
+          Properties:
+            Path: /delete
+            Method: get
+            ApiId: !Ref ApiGateway
+            PayloadFormatVersion: '1.0'
+        DeleteAuditLog:
+          Type: HttpApi
+          Properties:
+            Path: /audit
+            Method: get
+            ApiId: !Ref ApiGateway
+            PayloadFormatVersion: '1.0'
+
   FrontEndLogGroup:
     Type: AWS::Logs::LogGroup
     UpdateReplacePolicy: Retain
@@ -72,120 +101,7 @@ Resources:
     Properties:
       LogGroupName: !Sub '/aws/lambda/${AWS::StackName}-DemoFrontEnd'
       RetentionInDays: 90
-            
-  CreateAddress:
-    Type: AWS::Serverless::Function
-    DependsOn: CreateAddressLogGroup
-    Properties:
-      FunctionName: !Sub ${AWS::StackName}-CreateAddressFrontEnd
-      Description: Creates an address row in table and redirects back to /
-      Handler: demo.CreateAddressFrontEnd
-      AutoPublishAlias: SNAPSTART
-      SnapStart:
-        ApplyOn: PublishedVersions
-      Policies: 
-        - !Ref SecretsPolicy
-      Events:
-        HelloWorld:
-          Type: HttpApi
-          Properties:
-            Path: /create
-            Method: get
-            ApiId: !Ref ApiGateway
-  
-  CreateAddressLogGroup:
-    Type: AWS::Logs::LogGroup
-    UpdateReplacePolicy: Retain
-    DeletionPolicy: Delete
-    Properties:
-      LogGroupName: !Sub '/aws/lambda/${AWS::StackName}-CreateAddressFrontEnd'
-      RetentionInDays: 90
-            
-  MultipleAddress:
-    Type: AWS::Serverless::Function
-    DependsOn: MultipleAddressLogGroup
-    Properties:
-      FunctionName: !Sub ${AWS::StackName}-CreateMultipleAddressFrontEnd
-      Description: Creates multiple address rows in table and redirects back to /
-      Handler: demo.CreateMultipleAddressFrontEnd
-      AutoPublishAlias: SNAPSTART
-      SnapStart:
-        ApplyOn: PublishedVersions
-      Policies: 
-        - !Ref SecretsPolicy
-      Events:
-        HelloWorld:
-          Type: HttpApi
-          Properties:
-            Path: /multiple
-            Method: get
-            ApiId: !Ref ApiGateway
-  
-  MultipleAddressLogGroup:
-    Type: AWS::Logs::LogGroup
-    UpdateReplacePolicy: Retain
-    DeletionPolicy: Delete
-    Properties:
-      LogGroupName: !Sub '/aws/lambda/${AWS::StackName}-CreateMultipleAddressFrontEnd'
-      RetentionInDays: 90          
-            
-  DeleteAddress:
-    Type: AWS::Serverless::Function
-    DependsOn: DeleteAddressLogGroup
-    Properties:
-      FunctionName: !Sub ${AWS::StackName}-DeleteAddressFrontEnd
-      Description: Deletes an address row in table and redirects back to /
-      Handler: demo.DeleteAddressFrontEnd
-      AutoPublishAlias: SNAPSTART
-      SnapStart:
-        ApplyOn: PublishedVersions
-      Policies: 
-        - !Ref SecretsPolicy
-      Events:
-        HelloWorld:
-          Type: HttpApi
-          Properties:
-            Path: /delete
-            Method: get
-            ApiId: !Ref ApiGateway
-            
-  DeleteAddressLogGroup:
-    Type: AWS::Logs::LogGroup
-    UpdateReplacePolicy: Retain
-    DeletionPolicy: Delete
-    Properties:
-      LogGroupName: !Sub '/aws/lambda/${AWS::StackName}-DeleteAddressFrontEnd'
-      RetentionInDays: 90             
-            
-  DeleteAuditLog:
-    Type: AWS::Serverless::Function
-    DependsOn: DeleteAuditLogLogGroup
-    Properties:
-      FunctionName: !Sub ${AWS::StackName}-DeleteAuditLogFrontEnd
-      Description: Clears the audit_log table and redirects back to /
-      Handler: demo.DeleteAuditLogFrontEnd
-      AutoPublishAlias: SNAPSTART
-      SnapStart:
-        ApplyOn: PublishedVersions
-      Policies: 
-        - !Ref SecretsPolicy
-      Events:
-        HelloWorld:
-          Type: HttpApi
-          Properties:
-            Path: /audit
-            Method: get
-            ApiId: !Ref ApiGateway
-  
-  DeleteAuditLogLogGroup:
-    Type: AWS::Logs::LogGroup
-    UpdateReplacePolicy: Retain
-    DeletionPolicy: Delete
-    Properties:
-      LogGroupName: !Sub '/aws/lambda/${AWS::StackName}-DeleteAuditLogFrontEnd'
-      RetentionInDays: 90
-    
-    
+
   PostgresAddressTrigger:
     Type: AWS::Serverless::Function
     Properties:
