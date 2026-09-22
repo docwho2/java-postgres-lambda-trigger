@@ -1,7 +1,3 @@
-/*
- * Click nbfs://nbhost/SystemFileSystem/Templates/Licenses/license-default.txt to change this license
- * Click nbfs://nbhost/SystemFileSystem/Templates/Classes/Class.java to edit this template
- */
 package demo;
 
 import com.amazonaws.services.lambda.runtime.Context;
@@ -17,17 +13,40 @@ import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 
 /**
- *  Base class for handling triggers from Postgres
- * 
+ * Decodes row-change payloads produced by the PostgreSQL {@code record_change_lambda} function.
+ *
+ * <p>Payloads contain {@code TG_OP}, {@code TG_TABLE_NAME}, and the {@code old}/{@code new}
+ * row images. Subclasses implement the geocoding or audit side effect. The database invokes
+ * these handlers asynchronously, so the source transaction may not yet be committed.
+ *
  * @author sjensen
  */
 public abstract class PostgresAbstractTrigger implements RequestStreamHandler {
-    // Initialize the Log4j logger.
 
+    /**
+     * Creates a trigger handler with its logger and the shared JSON mapper.
+     */
+    public PostgresAbstractTrigger() {
+    }
+    /** Logger for decoded trigger payloads and processing failures. */
     final Logger log = LogManager.getLogger();
 
+    /** Shared JSON mapper used to decode trigger payloads and encode response/database JSON. */
     final static ObjectMapper mapper = new ObjectMapper();
 
+    /**
+     * Reads a trigger payload, invokes the subclass, and writes a JSON acknowledgement.
+     *
+     * <p>Exceptions from operation/row extraction or {@link #processEvent(TG_OP, String, JsonNode, JsonNode)}
+     * are logged and suppressed; the method still writes {@code {"status":"OK"}}. Such failures
+     * are therefore not reported to Lambda for retries. Initial JSON parsing and response I/O
+     * occur outside that catch block. Closing the response writer also closes {@code out}.
+     *
+     * @param in input stream containing the PostgreSQL row-change JSON document
+     * @param out output stream receiving the UTF-8 JSON acknowledgement
+     * @param cntxt Lambda invocation metadata; unused by this implementation
+     * @throws IOException if reading/parsing the input or writing/closing the response fails
+     */
     @Override
     public final void handleRequest(InputStream in, OutputStream out, Context cntxt) throws IOException {
         // Read in JSON Tree
@@ -51,20 +70,28 @@ public abstract class PostgresAbstractTrigger implements RequestStreamHandler {
     }
 
     /**
+     * Applies a subclass-specific side effect for one decoded row-change event.
      *
-     * @param operation
-     * @param table_name
-     * @param old_record
-     * @param new_record
+     * <p>The normal payload uses JSON null for the row image that does not exist for an
+     * INSERT or DELETE. Missing fields can also reach this method as Java {@code null};
+     * the base handler does not validate row shapes before dispatch.
+     *
+     * @param operation PostgreSQL operation decoded from {@code TG_OP}
+     * @param table_name source table name from {@code TG_TABLE_NAME}
+     * @param old_record pre-change row image, JSON null for INSERT, or {@code null} if absent
+     * @param new_record post-change row image, JSON null for DELETE, or {@code null} if absent
      */
     protected abstract void processEvent(TG_OP operation, String table_name, JsonNode old_record, JsonNode new_record);
 
     /**
-     * Trigger Operations
+     * Supported PostgreSQL row-change operations, matching the database's uppercase {@code TG_OP} values.
      */
     public enum TG_OP {
+        /** A new row was inserted; only the new row image is populated. */
         INSERT,
+        /** An existing row was changed; both old and new row images are populated. */
         UPDATE,
+        /** A row was removed; only the old row image is populated. */
         DELETE
     }
 }

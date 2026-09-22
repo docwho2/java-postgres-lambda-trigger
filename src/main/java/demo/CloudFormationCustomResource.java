@@ -1,7 +1,3 @@
-/*
- * Click nbfs://nbhost/SystemFileSystem/Templates/Licenses/license-default.txt to change this license
- * Click nbfs://nbhost/SystemFileSystem/Templates/Classes/Class.java to edit this template
- */
 package demo;
 
 import com.amazonaws.services.lambda.runtime.Context;
@@ -18,19 +14,44 @@ import software.amazon.lambda.powertools.cloudformation.AbstractCustomResourceHa
 import software.amazon.lambda.powertools.cloudformation.Response;
 
 /**
- * Custom resource called from Cloud Formation after the RDS instance is done provisioning. This lambda is responsible
- * for running all the SQL files in the correct order to initialize the DB.  Care should be taken to never throw an
- * Exception back or this will stall the stack operation and error the stack.
+ * Initializes the demo database through a CloudFormation custom resource after RDS provisioning.
+ *
+ * <p>The Powertools superclass dispatches lifecycle events and delivers responses to
+ * CloudFormation. CREATE executes the packaged SQL scripts in dependency order and inserts
+ * one sample address. UPDATE and DELETE acknowledge the event without modifying the database.
+ * Caught setup errors are only logged, so the returned CREATE response is not proof that
+ * every script or the sample insert succeeded.
  *
  * @author sjensen
  */
 public class CloudFormationCustomResource extends AbstractCustomResourceHandler {
 
-    // Initialize the Log4j logger.
+    /**
+     * Creates the database-initialization lifecycle handler and its Powertools response support.
+     */
+    public CloudFormationCustomResource() {
+    }
+
+    /** Logger for CloudFormation lifecycle events and SQL initialization failures. */
     Logger log = LogManager.getLogger();
     
+    /** Stable physical resource ID returned across CREATE, UPDATE, and DELETE callbacks. */
     private final static String RESOURCE_ID = "db_sql_initialize";
 
+    /**
+     * Executes the extension, trigger-function, table, and trigger scripts, then seeds an address.
+     *
+     * <p>Scripts are read from {@code LAMBDA_TASK_ROOT/scripts}. Each script's I/O or SQL
+     * failure is logged and execution continues to the next script. An outer database exception
+     * is also logged before returning the normal response. The scripts and seed insert are
+     * not enclosed in a single transaction, and repeated CREATE processing can insert another
+     * sample address. Uncaught runtime failures are left to the Powertools superclass.
+     *
+     * @param cfcre CloudFormation CREATE event; supplied to debug logging but not used for SQL inputs
+     * @param cntxt Lambda invocation metadata; unused by this callback
+     * @return a response with the stable physical resource ID and the reason
+     *         {@code SQL files applied to database}, even after the caught failures described above
+     */
     @Override
     protected Response create(CloudFormationCustomResourceEvent cfcre, Context cntxt) {
         try {
@@ -73,10 +94,11 @@ public class CloudFormationCustomResource extends AbstractCustomResourceHandler 
     }
 
     /**
-     * We don't do anything on stack updates, just return null
-     * @param cfcre
-     * @param cntxt
-     * @return 
+     * Acknowledges a stack update without rerunning initialization or applying schema changes.
+     *
+     * @param cfcre CloudFormation UPDATE event, including old/new properties; used only for logging
+     * @param cntxt Lambda invocation metadata; unused by this callback
+     * @return a response with the stable physical resource ID and the reason {@code UPDATE event ignored}
      */
     @Override
     protected Response update(CloudFormationCustomResourceEvent cfcre, Context cntxt) {
@@ -88,10 +110,14 @@ public class CloudFormationCustomResource extends AbstractCustomResourceHandler 
     }
 
     /**
-     * We don't need to do anything on stack delete, just return null
-     * @param cfcre
-     * @param cntxt
-     * @return 
+     * Acknowledges custom-resource deletion without issuing SQL or deleting database contents.
+     *
+     * <p>Deletion of the actual RDS resources is governed separately by their CloudFormation
+     * definitions and deletion policies.
+     *
+     * @param cfcre CloudFormation DELETE event; used only for debug logging
+     * @param cntxt Lambda invocation metadata; unused by this callback
+     * @return a response with the stable physical resource ID and the reason {@code DELETE event ignored}
      */
     @Override
     protected Response delete(CloudFormationCustomResourceEvent cfcre, Context cntxt) {

@@ -13,13 +13,25 @@ import org.jooq.exception.DataAccessException;
 import org.jooq.impl.DSL;
 
 /**
- * Handler for requests to Lambda function.
+ * Renders the demo's root page with address-action links and the contents of public tables.
+ *
+ * <p>{@link WebHandler} delegates {@code GET /} requests here. Tables are discovered from
+ * {@code information_schema.tables} in name order, and their rows are displayed by descending
+ * {@code id}. The view therefore assumes every discovered table has an {@code id} column.
+ * It reads all rows without pagination and formats them using jOOQ's HTML renderer.
  */
 public class FrontEnd implements RequestHandler<APIGatewayProxyRequestEvent, APIGatewayProxyResponseEvent> {
 
-     // Initialize the Log4j logger.
+    /**
+     * Creates the table-view renderer; database access is deferred until a page request is handled.
+     */
+    public FrontEnd() {
+    }
+
+    /** Logger for page requests and database query failures. */
     Logger log = LogManager.getLogger();
     
+    /** Shared response headers declaring the generated page as HTML. */
     final static Map<String, String> headers = new HashMap<>();
     
     static {
@@ -27,6 +39,18 @@ public class FrontEnd implements RequestHandler<APIGatewayProxyRequestEvent, API
     }
     
     
+    /**
+     * Reads the public schema and renders its tables together with the demo action controls.
+     *
+     * <p>Database query failures inside the rendering block are logged and converted to an
+     * HTTP 500 response. Database-context acquisition occurs before that block, so initialization
+     * failures are not converted by this method's exception handler.
+     *
+     * @param input API Gateway payload-format 1.0 request; used only for debug logging
+     * @param context Lambda invocation metadata; unused by this implementation
+     * @return HTTP 200 containing the generated HTML, or HTTP 500 containing a caught
+     *         database exception's text; both responses have an HTML content type
+     */
     @Override
     public APIGatewayProxyResponseEvent handleRequest(final APIGatewayProxyRequestEvent input, final Context context) {
         log.debug(input);
@@ -77,6 +101,13 @@ public class FrontEnd implements RequestHandler<APIGatewayProxyRequestEvent, API
         }
     }
 
+    /**
+     * Creates the opening Bootstrap panel markup for one database table.
+     *
+     * @param title panel heading inserted verbatim into HTML; callers must supply trusted
+     *              or already escaped text because this method does not escape it
+     * @return a new builder containing the panel heading and opening responsive body element
+     */
     public StringBuilder appendPanelStart(String title) {
         var sb = new StringBuilder();
         sb.append("<div class=\"panel panel-default\">\n");
@@ -86,10 +117,20 @@ public class FrontEnd implements RequestHandler<APIGatewayProxyRequestEvent, API
         return sb;
     }
 
+    /**
+     * Creates the closing markup matching {@link #appendPanelStart(String)}.
+     *
+     * @return a new builder that closes the panel body and outer panel elements
+     */
     public StringBuilder appendPanelEnd() {
         return new StringBuilder("</div></div>\n");
     }
     
+    /**
+     * Creates the page prologue, title, Bootstrap stylesheet link, and main container.
+     *
+     * @return a new builder with the document header and opening body/container markup
+     */
     private StringBuilder renderHTMLStart() {
         var sb = new StringBuilder();
         sb.append("<!DOCTYPE html>\n");
@@ -101,6 +142,11 @@ public class FrontEnd implements RequestHandler<APIGatewayProxyRequestEvent, API
         return sb;
     }
     
+    /**
+     * Creates the page epilogue matching {@link #renderHTMLStart()}.
+     *
+     * @return a new builder that closes the main container, body, and HTML document
+     */
     private StringBuilder renderHTMLEnd() {
         var sb = new StringBuilder();
         sb.append("</div>\n");
