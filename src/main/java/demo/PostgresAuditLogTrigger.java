@@ -29,19 +29,20 @@ public class PostgresAuditLogTrigger extends PostgresAbstractTrigger {
      * @param old_record pre-change image, or Java/JSON null when no old image exists
      * @param new_record post-change image, or Java/JSON null when no new image exists
      * @throws org.jooq.exception.DataAccessException if the insert fails; the base stream
-     *         handler logs and suppresses this failure under its current acknowledgement policy
+     *         handler propagates this failure to Lambda so its asynchronous retry policy applies
      */
     @Override
     protected void processEvent(TG_OP operation, String table_name, JsonNode old_record, JsonNode new_record) {
 
         // Just insert an Audit row for the operation
-        var dsl = PostgresDataSource.getDSL();
-        dsl.insertInto(DSL.table(DSL.name("audit_log")))
-                .set(DSL.field("operation"), operation.toString())
-                .set(DSL.field("table_name"), table_name)
-                .set(DSL.field("old_record",JSONB.class), old_record == null || old_record.isNull() ? null : JSONB.jsonb(old_record.toString()))
-                .set(DSL.field("new_record",JSONB.class), new_record == null || new_record.isNull() ? null : JSONB.jsonb(new_record.toString()))
-                .execute();
+        try (var dsl = PostgresDataSource.getDSL()) {
+            dsl.insertInto(DSL.table(DSL.name("audit_log")))
+                    .set(DSL.field("operation"), operation.toString())
+                    .set(DSL.field("table_name"), table_name)
+                    .set(DSL.field("old_record",JSONB.class), old_record == null || old_record.isNull() ? null : JSONB.jsonb(old_record.toString()))
+                    .set(DSL.field("new_record",JSONB.class), new_record == null || new_record.isNull() ? null : JSONB.jsonb(new_record.toString()))
+                    .execute();
+        }
     }
 
 }

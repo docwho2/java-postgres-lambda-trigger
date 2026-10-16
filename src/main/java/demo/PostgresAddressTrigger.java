@@ -3,6 +3,10 @@ package demo;
 import com.fasterxml.jackson.databind.JsonNode;
 import static demo.PostgresAbstractTrigger.TG_OP.INSERT;
 import java.util.Objects;
+import java.util.function.Function;
+import java.util.function.IntSupplier;
+import java.util.function.Supplier;
+import org.jooq.CloseableDSLContext;
 import org.jooq.JSONB;
 import org.jooq.impl.DSL;
 import software.amazon.awssdk.http.crt.AwsCrtHttpClient;
@@ -13,74 +17,69 @@ import software.amazon.awssdk.services.location.model.SearchPlaceIndexForTextRes
  * Geocodes address row changes with Amazon Location Service and persists the best match.
  *
  * <p>The database trigger selects INSERT/UPDATE rows whose {@code requires_geo_coding} flag
- * is true. This handler geocodes inserts and updates that change {@code address_1}; changing
- * only the city, district, or postal code does not cause a lookup here. A successful lookup
- * clears the flag to prevent the geocoding update from invoking this handler recursively.
+ * is true. This handler geocodes inserts and changes to any address component, including
+ * city, district, or postal code. A successful lookup clears the flag to prevent the geocoding update from invoking this handler recursively.
  *
  * @author sjensen
  */
 public class PostgresAddressTrigger extends PostgresAbstractTrigger {
 
-    /**
-     * Creates the geocoding handler after class initialization has prepared the shared Location client.
-     */
+    /** Maximum attempts to update a row that may not yet be visible after insertion. */
+    private static final int MAX_UPDATE_ATTEMPTS = 10;
+    /** Geocoding service boundary, initialized lazily by the production lookup. */
+    private final Function<String, SearchPlaceIndexForTextResponse> lookup;
+    /** Connection factory; each geocoding result is written within one closeable scope. */
+    private final Supplier<CloseableDSLContext> database;
+    /** Interruptible delay used between attempts, replaceable for deterministic tests. */
+    private final Sleeper sleeper;
+
+    /** Creates the handler without initializing AWS clients or opening database connections. */
     public PostgresAddressTrigger() {
-    }
-
-    /** Amazon Location client initialized once per execution environment and reused for lookups. */
-    static final LocationClient locationClient;
-    /** Place-index name read from the SAM-provided {@code PLACE_INDEX} environment variable. */
-    static final String PLACE_INDEX;
-
-    static {
-        locationClient = LocationClient.builder()
-                .httpClient(AwsCrtHttpClient.builder().build())
-                .build();
-
-        PLACE_INDEX = System.getenv("PLACE_INDEX");
+        this(PostgresAddressTrigger::lookupAddress, PostgresDataSource::getDSL, Thread::sleep);
     }
 
     /**
-     * Determines whether an address event requires a lookup and geocodes it when needed.
+     * Supplies external-operation boundaries for offline geocoding tests.
      *
-     * <p>INSERT always triggers a lookup. Other operations compare {@code address_1} in the
-     * two images; callers are expected to send UPDATE in that branch. DELETE is not supported
-     * by this address handler and is excluded by its database trigger. The geocoding flag is
-     * checked by the SQL trigger, not by this method.
+     * @param lookup address search operation
+     * @param database request-scoped connection factory
+     * @param sleeper interruptible backoff operation
+     * @throws NullPointerException if any dependency is null
+     */
+    PostgresAddressTrigger(Function<String, SearchPlaceIndexForTextResponse> lookup,
+            Supplier<CloseableDSLContext> database, Sleeper sleeper) {
+        this.lookup = Objects.requireNonNull(lookup);
+        this.database = Objects.requireNonNull(database);
+        this.sleeper = Objects.requireNonNull(sleeper);
+    }
+
+    /**
+     * Geocodes relevant address changes; DELETE and unchanged address components are no-ops.
      *
-     * @param operation expected INSERT or UPDATE operation from the address trigger
-     * @param table_name source table name; unused because this handler always updates {@code address}
-     * @param old_addr previous address image for UPDATE; unused for INSERT
-     * @param new_addr current address image containing the ID and address fields to geocode
-     * @throws org.jooq.exception.DataAccessException if persisting a geocoding result fails
+     * @param operation validated PostgreSQL row operation
+     * @param table_name source table; must be {@code address}
+     * @param old_addr previous row object for UPDATE, JSON null for INSERT
+     * @param new_addr current row object for INSERT/UPDATE, JSON null for DELETE
+     * @throws IllegalArgumentException if the source table or required address fields are invalid
+     * @throws IllegalStateException if the row never becomes visible or waiting is interrupted
+     * @throws org.jooq.exception.DataAccessException if the result cannot be persisted
      * @throws software.amazon.awssdk.core.exception.SdkException if the Location lookup fails
      */
     @Override
     protected void processEvent(TG_OP operation, String table_name, JsonNode old_addr, JsonNode new_addr) {
-
-        boolean needs_geocode = false;
-
-        if (operation.equals(INSERT)) {
-            // New Address, so always encode
-            needs_geocode = true;
-        } else {
-            // UPDATE, we need to determine if geo coding is required
-            // for now just look for address_1 changes
-            var old_address_1 = old_addr.findValue("address_1") != null ? old_addr.findValue("address_1").asText() : null;
-            var new_address_1 = new_addr.findValue("address_1") != null ? new_addr.findValue("address_1").asText() : null;
-
-            if (!Objects.equals(old_address_1, new_address_1)) {
-                needs_geocode = true;
-            }
-
+        if (!"address".equals(table_name)) {
+            throw new IllegalArgumentException("Geocoding only supports the address table");
         }
-
-        if (needs_geocode) {
+        if (operation == TG_OP.DELETE) {
+            return;
+        }
+        boolean changed = operation == INSERT;
+        for (var field : new String[]{"address_1", "city", "district", "postal_code"}) {
+            changed |= !Objects.equals(old_addr.get(field), new_addr.get(field));
+        }
+        if (changed) {
             geoCodeAddress(new_addr);
-        } else {
-            log.debug("No Geo Coding is required on this address");
         }
-
     }
 
     /**
@@ -90,67 +89,51 @@ public class PostgresAddressTrigger extends PostgresAbstractTrigger {
      * the formatted address, timestamp, longitude/latitude, and response JSON, and clears
      * {@code requires_geo_coding}. With no match, the row and flag remain unchanged.
      *
-     * <p>An update affecting zero rows is retried with linearly increasing sleeps of
-     * 100 milliseconds, allowing time for the originating transaction to commit. This loop
-     * has no explicit attempt/deadline limit and ignores interruption; a missing or rolled-back
-     * row can keep it running until the Lambda timeout or another failure terminates execution.
+     * <p>Zero-row updates are retried at most ten times with delays of 100 through 900 ms,
+     * allowing a briefly uncommitted source row to become visible. Exhaustion or interruption
+     * fails the invocation for Lambda's asynchronous retry policy. The database connection
+     * is closed on every exit path, and each update has a two-second query timeout.
      *
-     * @param addr address row image with {@code id}, {@code address_1}, {@code city},
-     *             {@code district}, and a {@code postal_code} field that may contain JSON null
+     * @param addr current row with an integer ID, nonblank street/city/district, and optional postal code
+     * @throws IllegalArgumentException if required row fields are missing or invalid
+     * @throws IllegalStateException if retries are exhausted or interrupted
      * @throws org.jooq.exception.DataAccessException if the database update fails
-     * @throws software.amazon.awssdk.core.exception.SdkException if the Location lookup fails
-     * @throws NullPointerException if a required JSON field is absent
+     * @throws software.amazon.awssdk.core.exception.SdkException if the lookup fails
      */
     private void geoCodeAddress(JsonNode addr) {
-        // Build address String
-        final var address = new StringBuilder(addr.findValue("address_1").asText());
-
-        // Required
-        address.append(", ").append(addr.findValue("city").asText());
-        address.append(", ").append(addr.findValue("district").asText());
-
-        if (!addr.findValue("postal_code").isNull()) {
-            address.append("  ").append(addr.findValue("postal_code").asText());
+        if (!addr.path("id").isIntegralNumber() || !addr.path("id").canConvertToInt()) {
+            throw new IllegalArgumentException("Address requires an integer id");
         }
-
-        var response = locationClient.searchPlaceIndexForText((t) -> {
-            t.indexName(PLACE_INDEX)
-                    .maxResults(1)
-                    .text(address.toString());
-        });
-
-        log.debug(response);
+        var address = new StringBuilder(requiredText(addr, "address_1"))
+                .append(", ").append(requiredText(addr, "city"))
+                .append(", ").append(requiredText(addr, "district"));
+        var postalCode = addr.path("postal_code");
+        if (!postalCode.isNull() && !postalCode.isMissingNode()) {
+            if (!postalCode.isTextual()) {
+                throw new IllegalArgumentException("Address postal_code must be text or null");
+            }
+            address.append("  ").append(postalCode.asText());
+        }
+        var response = lookup.apply(address.toString());
 
         if (response.hasResults()) {
             final var place = response.results().get(0).place();
 
             // Take the response and create a serializable version that we can later convert to JSON
             var last_coding = mapper.convertValue(response.toBuilder(), SearchPlaceIndexForTextResponse.serializableBuilderClass());
-            var dsl = PostgresDataSource.getDSL();
-            var statement = dsl.update(DSL.table("address"))
-                    // Make sure we set this to false so we don't trigger ourselves again
-                    .set(DSL.field("requires_geo_coding", Boolean.class), false)
-                    .set(DSL.field("address_formatted"), place.label())
-                    .set(DSL.field("geo_coded"), DSL.now())
-                    .set(DSL.field("geo_longitude", Double.class), place.geometry().point().get(0))
-                    .set(DSL.field("geo_latitude", Double.class), place.geometry().point().get(1))
-                    .set(DSL.field("geo_last_coding", JSONB.class), JSONB.jsonb(mapper.valueToTree(last_coding).toString()))
-                    .where(DSL.field("id", Integer.class).eq(addr.findValue("id").asInt()));
+            try (var dsl = database.get()) {
+                var statement = dsl.update(DSL.table("address"))
+                        // Make sure we set this to false so we don't trigger ourselves again
+                        .set(DSL.field("requires_geo_coding", Boolean.class), false)
+                        .set(DSL.field("address_formatted"), place.label())
+                        .set(DSL.field("geo_coded"), DSL.now())
+                        .set(DSL.field("geo_longitude", Double.class), place.geometry().point().get(0))
+                        .set(DSL.field("geo_latitude", Double.class), place.geometry().point().get(1))
+                        .set(DSL.field("geo_last_coding", JSONB.class), JSONB.jsonb(mapper.valueToTree(last_coding).toString()))
+                        .where(DSL.field("id", Integer.class).eq(addr.path("id").asInt()));
 
-            int updated = 0;
-            int counter = 0;
-            while (updated == 0) {
-                updated = statement.execute();
-                if (updated == 0) {
-                    // Sleep a little since row did not update
-                    try {
-                        var sleep = ++counter * 100;
-                        log.debug("Sleeping " + sleep + " ms due to insert not finding row yet");
-                        Thread.sleep(sleep);
-                    } catch (InterruptedException ie) {
-
-                    }
-                }
+                statement.queryTimeout(2);
+                retryUpdate(statement::execute, sleeper);
             }
 
         } else {
@@ -158,4 +141,87 @@ public class PostgresAddressTrigger extends PostgresAbstractTrigger {
         }
     }
 
+    /**
+     * Repeats a zero-row update with bounded backoff while preserving interruption.
+     *
+     * @param update database statement execution returning its affected-row count
+     * @param sleeper delay operation; tests may supply a no-wait implementation
+     * @throws IllegalStateException if all attempts miss the row or the thread is interrupted
+     */
+    static void retryUpdate(IntSupplier update, Sleeper sleeper) {
+        for (int attempt = 1; attempt <= MAX_UPDATE_ATTEMPTS; attempt++) {
+            if (Thread.currentThread().isInterrupted()) {
+                throw new IllegalStateException("Geocoding update interrupted");
+            }
+            if (update.getAsInt() > 0) {
+                return;
+            }
+            if (attempt < MAX_UPDATE_ATTEMPTS) {
+                try {
+                    sleeper.sleep(attempt * 100L);
+                } catch (InterruptedException failure) {
+                    Thread.currentThread().interrupt();
+                    throw new IllegalStateException("Geocoding update interrupted", failure);
+                }
+            }
+        }
+        throw new IllegalStateException("Address row was not visible after ten update attempts");
+    }
+
+    /**
+     * Validates a required textual address component before calling external services.
+     *
+     * @param row address row image
+     * @param field address component name
+     * @return nonblank component value
+     * @throws IllegalArgumentException if the field is missing, blank, or not textual
+     */
+    private static String requiredText(JsonNode row, String field) {
+        var value = row.path(field);
+        if (!value.isTextual() || value.asText().isBlank()) {
+            throw new IllegalArgumentException("Address requires nonblank " + field);
+        }
+        return value.asText();
+    }
+
+    /**
+     * Queries the configured place index for its best address match.
+     *
+     * @param address formatted address search string
+     * @return Location response containing zero or one result
+     * @throws IllegalStateException if the place-index setting is absent
+     * @throws software.amazon.awssdk.core.exception.SdkException if the service call fails
+     */
+    private static SearchPlaceIndexForTextResponse lookupAddress(String address) {
+        var index = System.getenv("PLACE_INDEX");
+        if (index == null || index.isBlank()) {
+            throw new IllegalStateException("Missing required environment variable: PLACE_INDEX");
+        }
+        return LocationHolder.CLIENT.searchPlaceIndexForText(request -> request
+                .indexName(index).maxResults(1).text(address));
+    }
+
+    /** Lazily initializes the reusable SDK client only for invocations that need geocoding. */
+    private static final class LocationHolder {
+        /** Prevents construction of the static client holder. */
+        private LocationHolder() {
+        }
+        /** Shared Location client; SDK calls are bounded separately from database retries. */
+        private static final LocationClient CLIENT = LocationClient.builder()
+                .httpClient(AwsCrtHttpClient.builder().build())
+                .overrideConfiguration(config -> config.apiCallTimeout(java.time.Duration.ofSeconds(5)))
+                .build();
+    }
+
+    /** Interruptible backoff operation used between database update attempts. */
+    @FunctionalInterface
+    interface Sleeper {
+        /**
+         * Delays the next attempt for the requested duration.
+         *
+         * @param milliseconds delay duration
+         * @throws InterruptedException if the waiting thread is interrupted
+         */
+        void sleep(long milliseconds) throws InterruptedException;
+    }
 }

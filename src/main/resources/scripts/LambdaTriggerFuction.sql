@@ -15,8 +15,9 @@ DECLARE
 json_all jsonb;
 BEGIN
 
-IF TG_ARGV[0] = NULL THEN
-	RAISE EXCEPTION 'Lambda Function Name required as first parmeter';
+-- SQL equality with NULL never yields true; reject missing/blank arguments explicitly.
+IF TG_NARGS < 1 OR TG_ARGV[0] IS NULL OR btrim(TG_ARGV[0]) = '' THEN
+	RAISE EXCEPTION 'Lambda function name required as first parameter';
 END IF;
 
 -- JSON Structure with old an new set to null
