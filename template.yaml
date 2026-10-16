@@ -163,7 +163,16 @@ Resources:
             QueueName: !Sub ${AWS::StackName}-AuditLog
             ReceiveMessageWaitTimeSeconds: 0
             MessageRetentionPeriod: 86400
-            VisibilityTimeout: 30
+            # Six times the consumer's 30-second timeout leaves room for throttling/retries.
+            VisibilityTimeout: 180
+            RedrivePolicy:
+                deadLetterTargetArn: !GetAtt AuditDeadLetterQueue.Arn
+                maxReceiveCount: 5
+
+  AuditDeadLetterQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      MessageRetentionPeriod: 1209600
   
   SendToSQS:
     Type: AWS::Serverless::Function
@@ -209,6 +218,8 @@ Resources:
           Type: SQS
           Properties:
             BatchSize: 1
+            FunctionResponseTypes:
+                - ReportBatchItemFailures
             Queue: !GetAtt SQSQueue.Arn
             ScalingConfig:
                 MaximumConcurrency: 2
@@ -247,7 +258,12 @@ Resources:
   
   DBCustom:
     Type: Custom::DBInitialization
-    DependsOn: RDSStack  # Make sure the RDS instance is done before we run DB Scripts
+    # The seed insert fires database triggers, so their target functions must already exist.
+    DependsOn:
+      - RDSStack
+      - PostgresAddressTrigger
+      - PostgresAuditLogTrigger
+      - SendToSQS
     Properties:
         ServiceToken: !GetAtt DBInitialization.Arn
 

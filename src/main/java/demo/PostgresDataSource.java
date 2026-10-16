@@ -1,104 +1,137 @@
 package demo;
 
 import com.amazonaws.secretsmanager.sql.AWSSecretsManagerPostgreSQLDriver;
-import java.sql.Connection;
 import java.sql.DriverManager;
 import java.sql.SQLException;
 import java.util.Properties;
-import org.jooq.DSLContext;
+import org.jooq.CloseableDSLContext;
 import org.jooq.SQLDialect;
+import org.jooq.exception.DataAccessException;
 import org.jooq.impl.DSL;
 import org.postgresql.PGConnection;
 
 /**
- * Creates PostgreSQL connections using credentials resolved by the AWS Secrets Manager JDBC driver.
+ * Opens request-scoped PostgreSQL connections using the Secrets Manager JDBC driver.
  *
- * <p>The SAM environment provides {@code DB_MASTER_SECRET_ARN}, {@code DB_ENDPOINT}, and
- * {@code DB_NAME}. Class initialization registers the Secrets Manager PostgreSQL driver and
- * selects the AWS URL-connection HTTP implementation. Each factory call opens a separate
- * connection; this class provides neither pooling nor automatic connection cleanup.
- *
- * @author jensen
+ * <p>Every {@link #getDSL()} result owns its connection and must be closed with
+ * try-with-resources. No live database connection is retained during Lambda initialization
+ * or between requests. Missing configuration and connection failures fail immediately.
  */
 public class PostgresDataSource {
 
-    /**
-     * Creates an instance with no per-instance state; database access is provided by the static factories.
-     */
+    /** Creates the stateless factory; all database entry points are static. */
     public PostgresDataSource() {
     }
 
     /**
-     * Secret ARN passed as the JDBC user property so the driver can resolve database credentials.
+     * Opens a closeable jOOQ context with credentials resolved from the configured RDS secret.
+     *
+     * @return a new PostgreSQL context whose connection is closed by {@code close()}
+     * @throws IllegalStateException if a required environment variable or JDBC driver is missing
+     * @throws DataAccessException if the JDBC connection cannot be established
      */
-    static final String SECRET_ARN = System.getenv("DB_MASTER_SECRET_ARN");
-    /** Database hostname supplied by the nested RDS stack through the SAM environment. */
-    static final String DB_ENDPOINT = System.getenv("DB_ENDPOINT");
-    /** Database name appended to the Secrets Manager JDBC URL. */
-    static final String DB_NAME = System.getenv("DB_NAME");
-    
-    /** Shared JDBC connection properties containing the secret ARN in the user field. */
-    static final Properties info;
-
-    static {
-        
-        System.setProperty("software.amazon.awssdk.http.service.impl", 
-                "software.amazon.awssdk.http.urlconnection.UrlConnectionSdkHttpService");
-
-        System.out.println("Secrets ARN is " + SECRET_ARN);
-        // Load the JDBC driver
-        var driver = new AWSSecretsManagerPostgreSQLDriver();
-        System.out.println("Driver initialzied " + driver);
-        info = new Properties();
-        info.put("user", SECRET_ARN);
+    public static CloseableDSLContext getDSL() {
+        var properties = connectionProperties();
+        var url = connectionUrl();
+        initializeDriver();
+        return openDSL(url, properties);
     }
 
     /**
-     * Opens a new connection to the configured database using the Secrets Manager driver.
+     * Opens a PostgreSQL context for a JDBC URL, retaining ownership of the connection.
+     * This package-private boundary also allows lifecycle tests with an offline JDBC driver.
      *
-     * <p>SQL connection failures are printed to standard error and converted to {@code null}.
-     * The factory does not retry, cache, or close a successfully opened connection.
-     *
-     * @return a newly opened JDBC connection, or {@code null} when the driver throws
-     *         {@link SQLException}; the caller is responsible for the connection's lifetime
+     * @param url JDBC connection URL
+     * @param properties driver credentials and connection options
+     * @return a context that closes the connection when its scope ends
+     * @throws DataAccessException if connection creation fails
      */
-    private static Connection getConnection() {
+    static CloseableDSLContext openDSL(String url, Properties properties) {
+        // The URL overload owns its connection; DSL.using(Connection) does not.
+        var dsl = DSL.using(url, properties);
+        dsl.configuration().set(SQLDialect.POSTGRES);
+        return dsl;
+    }
+
+    /**
+     * Opens the PostgreSQL-specific view for callers that need driver extensions.
+     *
+     * <p>The caller must close the underlying connection by casting the returned PostgreSQL driver object
+     * to {@link java.sql.Connection}, or use {@link #getDSL()} instead. This method is not
+     * used by the demo handlers.
+     *
+     * @return the PostgreSQL connection implementing the driver-specific interface
+     * @throws SQLException if opening or unwrapping the JDBC connection fails
+     * @throws IllegalStateException if database configuration or the driver is missing
+     */
+    public static PGConnection getPGConnection() throws SQLException {
+        var properties = connectionProperties();
+        var url = connectionUrl();
+        initializeDriver();
+        var connection = DriverManager.getConnection(url, properties);
         try {
-            // Establish the connection
-            // Set the endpoint and port. You can also retrieve it from a key/value pair in the secret.
-            final String URL = "jdbc-secretsmanager:postgresql://" + DB_ENDPOINT + "/" + DB_NAME;
-            return DriverManager.getConnection(URL, info);
-        } catch (SQLException se) {
-            System.err.println(se.getMessage());
-            return null;
+            return connection.unwrap(PGConnection.class);
+        } catch (SQLException | RuntimeException failure) {
+            // An unwrap failure must not orphan an otherwise successfully opened connection.
+            try {
+                connection.close();
+            } catch (SQLException closeFailure) {
+                failure.addSuppressed(closeFailure);
+            }
+            throw failure;
         }
     }
 
     /**
-     * Opens a connection and exposes PostgreSQL-specific driver operations through unwrapping.
+     * Resolves the secret ARN without logging credentials or secret identifiers.
      *
-     * <p>Only the {@link PGConnection} view is returned; the underlying JDBC connection is
-     * not closed by this method or retained by this class for later cleanup.
-     *
-     * @return the PostgreSQL-specific view of the newly opened JDBC connection
-     * @throws SQLException if the opened connection cannot be unwrapped as a PostgreSQL connection
-     * @throws NullPointerException if connection acquisition failed and returned {@code null}
+     * @return JDBC properties using the secret ARN as the driver username
+     * @throws IllegalStateException if the secret ARN environment variable is absent or blank
      */
-    public static PGConnection getPGConnection() throws SQLException {
-        return (getConnection().unwrap(PGConnection.class));
+    private static Properties connectionProperties() {
+        var properties = new Properties();
+        properties.put("user", requiredEnvironment("DB_MASTER_SECRET_ARN"));
+        return properties;
     }
 
     /**
-     * Creates a jOOQ context configured with the PostgreSQL dialect and a fresh JDBC connection.
+     * Builds the JDBC URL from the deployment's endpoint and database name.
      *
-     * <p>The context wraps the connection supplied by {@link #getConnection()}; this factory
-     * does not provide pooling, transaction boundaries, or automatic connection cleanup.
-     * If acquisition returns {@code null}, the context has no usable connection for execution.
-     *
-     * @return a PostgreSQL jOOQ context for constructing and executing the demo's SQL statements
+     * @return the Secrets Manager PostgreSQL JDBC URL
+     * @throws IllegalStateException if either required environment variable is absent or blank
      */
-    public static DSLContext getDSL() {
-        return (DSL.using(getConnection(), SQLDialect.POSTGRES));
+    private static String connectionUrl() {
+        return "jdbc-secretsmanager:postgresql://" + requiredEnvironment("DB_ENDPOINT")
+                + "/" + requiredEnvironment("DB_NAME");
     }
 
+    /**
+     * Reads a required deployment setting and reports its name without exposing its value.
+     *
+     * @param name environment variable to read
+     * @return the nonblank configured value
+     * @throws IllegalStateException if the variable is absent or blank
+     */
+    private static String requiredEnvironment(String name) {
+        var value = System.getenv(name);
+        if (value == null || value.isBlank()) {
+            throw new IllegalStateException("Missing required environment variable: " + name);
+        }
+        return value;
+    }
+
+    /**
+     * Loads the Secrets Manager driver once through JVM class initialization, at first use.
+     *
+     * @throws IllegalStateException if the driver is missing from the deployment package
+     */
+    private static void initializeDriver() {
+        System.setProperty("software.amazon.awssdk.http.service.impl",
+                "software.amazon.awssdk.http.urlconnection.UrlConnectionSdkHttpService");
+        try {
+            Class.forName(AWSSecretsManagerPostgreSQLDriver.class.getName());
+        } catch (ClassNotFoundException failure) {
+            throw new IllegalStateException("Secrets Manager PostgreSQL driver is unavailable", failure);
+        }
+    }
 }

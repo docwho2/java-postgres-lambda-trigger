@@ -9,7 +9,7 @@ Why even use this feature?  If you have many code bases that are writing data to
 Things to consider:
 - If you fire off lambdas for row updates that themselves update the DB then you can quickly exaust connection and lambda resources.  If you update 1000 rows then you could have hundreds of lambdas fire and connect to the DB bringing everything to a grinding halt.  Therefore you should set [concurrency limits](https://aws.amazon.com/blogs/compute/managing-aws-lambda-function-concurrency/) on these lambda functions in most cases.
 - When you exceed the limit, you get a throttle on the lambda, and these will delay processing.  In some cases this is fine.  In the Geo coding use case we don't need the Geo coding to complete immediately, so it's OK.  In testing 1K+ row updates for Geo coding some row updates took over 1 minute to complete because of the retry back off.
-- If you need smoother execution of the events, then consider using a simple NodeJS Lambda (that won't be throttled) that takes the event payload and puts it on a SQS queue that another Lambda will process from the queue.  See a NodeJS example of this in the [ForwardToSQS.js](ForwardToSQS.js) file.
+- If you need smoother execution of the events, then consider using a simple NodeJS Lambda (which remains subject to Lambda concurrency limits) that takes the event payload and puts it on a SQS queue that another Lambda will process from the queue.  See a NodeJS example of this in the [ForwardToSQS.js](ForwardToSQS.js) file.
 
 Three use cases are covered in this demo:
 - A Lambda([PostgresAddressTrigger.java](src/main/java/demo/PostgresAddressTrigger.java)) that will update the same row that the trigger is firing on.  In this case, we have an address table, and when addresses are inserted or updated, they will be geo-coded by the [AWS Location API](https://docs.aws.amazon.com/location/latest/APIReference/API_SearchPlaceIndexForText.html).  Special care is needed in this case to prevent recursive triggering of the function.
@@ -49,6 +49,74 @@ Updating an existing stack removes the four former action Lambdas and their log 
 successful action redirects (`307`, `Location: /`) remain the same.
 
 Run the offline routing and action-response tests with `mvn clean test` before `sam build`.
+
+## Runtime behavior and failure handling
+
+| Component | Success | Failure and retry behavior |
+| --- | --- | --- |
+| UI (`WebHandler`) | Delegates directly to the view/action; actions redirect to `/` | Acquisition and action/query errors return HTTP 500. Each request closes its JDBC connection. |
+| Direct database triggers | Validate the top-level event, perform the side effect, then acknowledge | Validation and persistence errors fail the invocation so the configured Lambda asynchronous retry policy applies. |
+| SQS audit consumer | Processes every record; successful records are acknowledged | Returns failed message IDs using `ReportBatchItemFailures`. After five receives, unsuccessful messages move to `AuditDeadLetterQueue`, which retains them for 14 days. |
+| Address geocoding | Looks up inserts and changes to street, city, district, or postal code | A zero-row update retries at most ten times, with 100–900 ms delays. Exhaustion, interruption, service errors, and SQL errors fail the invocation. |
+| Database setup | Loads all packaged SQL assets, executes them in order, then inserts the sample address | Stops at the first failure and returns CloudFormation `FAILED`; previously applied scripts may remain. UPDATE and DELETE do not rerun initialization. |
+
+The SQS source queue's visibility timeout is 180 seconds, six times the consumer's
+30-second timeout, following [AWS's SQS configuration guidance](https://docs.aws.amazon.com/lambda/latest/dg/services-sqs-configure.html).
+The consumer and its `FunctionResponseTypes: [ReportBatchItemFailures]` configuration must
+be deployed together for [partial batch retries](https://docs.aws.amazon.com/lambda/latest/dg/services-sqs-errorhandling.html).
+The batch size remains one, but the implementation also handles larger standard-queue batches.
+Inspect the dead-letter queue and correct the cause before intentionally replaying its messages.
+
+`PostgresDataSource.getDSL()` returns a `CloseableDSLContext` that owns its connection.
+Always use `try (var dsl = PostgresDataSource.getDSL()) { ... }`; passing an existing JDBC
+connection to `DSL.using(connection)` does not transfer connection ownership. No live JDBC
+connection is retained at initialization or across warm invocations. This is connection
+cleanup, not pooling: a connection pool or RDS Proxy would need separate load testing.
+
+The geocoding SQL trigger still requires `requires_geo_coding = true`. Callers editing an
+already-geocoded address must set this flag if they want another lookup. A lookup with no
+match leaves the row unchanged. Each Location call has a five-second API timeout and each
+geocoding UPDATE a two-second query timeout; retry limits do not guarantee a fixed end-to-end
+latency because connection establishment and service execution also take time.
+
+### Delivery and deployment limits
+
+- Database-trigger invocations are asynchronous external side effects. They may run before
+  the source transaction commits, and rolling back that transaction does not retract them.
+  This demo does not implement a transactional outbox.
+- Delivery is at-least-once. Audit tables do not deduplicate; a successful write followed by
+  a lost acknowledgement can be repeated. Standard SQS and asynchronous Lambda delivery also
+  do not guarantee ordering, so concurrent address edits can race with geocoding results.
+- Direct-trigger retries remain finite (`MaximumRetryAttempts: 2`, event age one hour),
+  and those functions have no failure destination configured. The new dead-letter queue
+  covers the SQS consumer only.
+- Setup is not one atomic migration, and repeated CREATE processing can insert another sample
+  row. Changing packaged SQL does not apply it to an existing database: the custom resource's
+  UPDATE callback deliberately performs no SQL migrations. The trigger argument guard in
+  `LambdaTriggerFuction.sql` therefore requires an explicit migration on an existing database.
+- This is an unauthenticated demo with GET routes that mutate data and a publicly reachable
+  database security-group rule. Restrict access and add authentication/CSRF protection before
+  using it with sensitive data. The UI currently renders all public tables without pagination.
+
+### Local validation
+
+Run `mvn clean test` for the offline tests, then `sam validate --lint` and `sam build --no-cached`.
+The JDBC fixture exercises statement execution and connection closure without a live database;
+service fakes exercise validation, retries, and failure responses. These checks do not prove a
+live Aurora migration, IAM permissions, AWS retry delivery, or geocoding latency.
+
+For strict documentation validation, include production, private, and test declarations:
+
+```bash
+mvn -q dependency:build-classpath -Dmdep.includeScope=test -Dmdep.outputFile=target/javadoc-classpath.txt
+javadoc -quiet -private -Xdoclint:all -Werror \
+  -classpath "$(cat target/javadoc-classpath.txt)" -d target/javadoc \
+  src/main/java/demo/*.java src/test/java/demo/*.java
+```
+
+Before deploying merged PRs, switch to current `main` and rebuild; `sam deploy` can otherwise
+use stale `.aws-sam/build` artifacts. Verify `EngineVersion` in both `postgres.yaml` and
+`.aws-sam/build/RDSStack/template.yaml`, plus the handlers and runtimes in the built template.
 
 ## Contents
 This project contains source code and supporting files for a serverless application that you can deploy with the SAM CLI. It includes the following files and folders.

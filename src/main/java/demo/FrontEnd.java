@@ -9,7 +9,6 @@ import com.amazonaws.services.lambda.runtime.events.APIGatewayProxyRequestEvent;
 import com.amazonaws.services.lambda.runtime.events.APIGatewayProxyResponseEvent;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
-import org.jooq.exception.DataAccessException;
 import org.jooq.impl.DSL;
 
 /**
@@ -42,9 +41,8 @@ public class FrontEnd implements RequestHandler<APIGatewayProxyRequestEvent, API
     /**
      * Reads the public schema and renders its tables together with the demo action controls.
      *
-     * <p>Database query failures inside the rendering block are logged and converted to an
-     * HTTP 500 response. Database-context acquisition occurs before that block, so initialization
-     * failures are not converted by this method's exception handler.
+     * <p>Database acquisition and rendering failures are logged and converted to an HTTP 500
+     * response. The request owns its connection and closes it on success or failure.
      *
      * @param input API Gateway payload-format 1.0 request; used only for debug logging
      * @param context Lambda invocation metadata; unused by this implementation
@@ -54,11 +52,10 @@ public class FrontEnd implements RequestHandler<APIGatewayProxyRequestEvent, API
     @Override
     public APIGatewayProxyResponseEvent handleRequest(final APIGatewayProxyRequestEvent input, final Context context) {
         log.debug(input);
-        var dsl = PostgresDataSource.getDSL();
         APIGatewayProxyResponseEvent response = new APIGatewayProxyResponseEvent()
                 .withHeaders(headers);
         
-        try {
+        try (var dsl = PostgresDataSource.getDSL()) {
             final var sb = renderHTMLStart();
             
             sb.append("<h3>Postgres Java Lambda Trigger Demo</h3>");
@@ -93,7 +90,7 @@ public class FrontEnd implements RequestHandler<APIGatewayProxyRequestEvent, API
             return response
                     .withStatusCode(200)
                     .withBody(sb.toString());
-        } catch (DataAccessException e) {
+        } catch (RuntimeException e) {
             log.error("Front End Error", e);
             return response
                     .withBody(e.toString())

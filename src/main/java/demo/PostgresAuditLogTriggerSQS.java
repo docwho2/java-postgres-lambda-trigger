@@ -2,85 +2,96 @@ package demo;
 
 import com.amazonaws.services.lambda.runtime.Context;
 import com.amazonaws.services.lambda.runtime.RequestHandler;
+import com.amazonaws.services.lambda.runtime.events.SQSBatchResponse;
 import com.amazonaws.services.lambda.runtime.events.SQSEvent;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import java.util.ArrayList;
+import java.util.Objects;
+import java.util.function.Consumer;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
-import org.jooq.DSLContext;
 import org.jooq.JSONB;
 import org.jooq.impl.DSL;
 
 /**
- * Records PostgreSQL row-change payloads delivered through SQS in {@code audit_log_sqs}.
+ * Persists SQS-delivered audit events and reports only failed records for redelivery.
  *
- * <p>The forwarding Lambda places the original trigger JSON in each message body. This
- * consumer processes only the first record, matching the SAM event source's batch size of one.
- * It holds a database context for the execution environment's lifetime and does not deduplicate
- * messages. Processing exceptions are logged and suppressed, so returning normally can acknowledge
- * a message whose audit insert failed.
+ * <p>The SAM event source must enable {@code ReportBatchItemFailures}. Each successful
+ * insert owns and closes its database connection. Delivery remains at-least-once; no
+ * application-level deduplication is performed. No database access occurs at initialization.
  */
-public class PostgresAuditLogTriggerSQS implements RequestHandler<SQSEvent, Void> {
+public class PostgresAuditLogTriggerSQS implements RequestHandler<SQSEvent, SQSBatchResponse> {
 
-    /**
-     * Creates the queue consumer after class initialization has opened the shared database context.
-     */
+    /** Logger for failed message identifiers and processing errors. */
+    private static final Logger LOG = LogManager.getLogger();
+    /** Reusable JSON codec; never holds a request's payload between invocations. */
+    private static final ObjectMapper MAPPER = new ObjectMapper();
+    /** Record persistence operation, replaceable within the package for offline tests. */
+    private final Consumer<PostgresChange> writer;
+
+    /** Creates the production consumer without connecting to PostgreSQL. */
     public PostgresAuditLogTriggerSQS() {
+        this(PostgresAuditLogTriggerSQS::writeAudit);
     }
 
-    /** Logger for queue payloads, empty message bodies, and processing failures. */
-    final Logger log = LogManager.getLogger();
-
-    /** Database context opened during class initialization and reused across invocations. */
-    final static DSLContext dsl = PostgresDataSource.getDSL();
-
-    /** Shared mapper used to parse the original PostgreSQL trigger JSON from message bodies. */
-    final static ObjectMapper mapper = new ObjectMapper();
+    /**
+     * Creates a consumer with a supplied persistence operation for deterministic tests.
+     *
+     * @param writer operation that returns only after its audit write succeeds
+     * @throws NullPointerException if the writer is null
+     */
+    PostgresAuditLogTriggerSQS(Consumer<PostgresChange> writer) {
+        this.writer = Objects.requireNonNull(writer);
+    }
 
     /**
-     * Parses the first SQS message and inserts its operation and row images into the audit table.
+     * Processes every record independently, allowing successful messages to be acknowledged.
      *
-     * <p>Empty bodies are logged and skipped. Other parsing or database exceptions inside
-     * the method are logged and suppressed. Additional records in a larger batch would be
-     * ignored, so the event source must retain its batch size of one. This handler does not
-     * return partial batch failures or throw processing errors for SQS retries.
+     * <p>Invalid or empty message bodies are failures, not successful no-ops. All message IDs
+     * are checked before any writes, because a partial-failure response needs usable IDs.
      *
-     * @param event SQS event expected to contain exactly one record with PostgreSQL trigger JSON
-     * @param context Lambda invocation metadata; unused by this implementation
-     * @return always {@code null}, including when a message is skipped or processing fails
+     * @param event batch from the standard SQS queue; an empty batch is a successful no-op
+     * @param context Lambda metadata; unused
+     * @return failed message IDs for Lambda to retry, with successful records omitted
+     * @throws IllegalArgumentException if the batch or a message identifier is absent
      */
     @Override
-    public Void handleRequest(SQSEvent event, Context context) {
-        try {
-            // We will only ever get one message set on the trigger
-            SQSEvent.SQSMessage mesg = event.getRecords().get(0);
-            String body = mesg.getBody();
-
-            if (body == null || body.isEmpty()) {
-                log.error("Message Body is empty, ignoring message");
-                return null;
-            }
-            // Read in JSON Tree 
-            var json = mapper.readTree(body);
-            log.debug("INPUT EVENT JSON is " + json.toPrettyString());
-
-            final var operation = json.findValue("TG_OP").asText();
-            final var table_name = json.findValue("TG_TABLE_NAME").asText();
-            final var old_record = json.findValue("old");
-            final var new_record = json.findValue("new");
-
-            // Just insert an Audit row for the operation
-            dsl.insertInto(DSL.table("audit_log_sqs"))
-                    .set(DSL.field("operation"), operation)
-                    .set(DSL.field("table_name"), table_name)
-                    .set(DSL.field("old_record", JSONB.class), old_record == null || old_record.isNull() ? null : JSONB.jsonb(old_record.toString()))
-                    .set(DSL.field("new_record", JSONB.class), new_record == null || new_record.isNull() ? null : JSONB.jsonb(new_record.toString()))
-                    .execute();
-
-        } catch (Exception e) {
-            log.error("Error Processing Event", e);
+    public SQSBatchResponse handleRequest(SQSEvent event, Context context) {
+        if (event == null || event.getRecords() == null) {
+            throw new IllegalArgumentException("SQS event requires records");
         }
-
-        return null;
+        for (var message : event.getRecords()) {
+            if (message == null || message.getMessageId() == null || message.getMessageId().isBlank()) {
+                throw new IllegalArgumentException("SQS record requires a message ID");
+            }
+        }
+        var failures = new ArrayList<SQSBatchResponse.BatchItemFailure>();
+        for (var message : event.getRecords()) {
+            try {
+                var change = PostgresChange.fromJson(MAPPER.readTree(message.getBody()));
+                writer.accept(change);
+            } catch (Exception failure) {
+                LOG.error("Failed to process SQS message {}", message.getMessageId(), failure);
+                failures.add(new SQSBatchResponse.BatchItemFailure(message.getMessageId()));
+            }
+        }
+        return new SQSBatchResponse(failures);
     }
 
+    /**
+     * Writes one audit row using a connection closed before this method returns.
+     *
+     * @param change validated operation and row images from the message body
+     * @throws org.jooq.exception.DataAccessException if connection acquisition or insertion fails
+     */
+    private static void writeAudit(PostgresChange change) {
+        try (var dsl = PostgresDataSource.getDSL()) {
+            dsl.insertInto(DSL.table("audit_log_sqs"))
+                    .set(DSL.field("operation"), change.operation().toString())
+                    .set(DSL.field("table_name"), change.tableName())
+                    .set(DSL.field("old_record", JSONB.class), change.oldRecord().isNull() ? null : JSONB.jsonb(change.oldRecord().toString()))
+                    .set(DSL.field("new_record", JSONB.class), change.newRecord().isNull() ? null : JSONB.jsonb(change.newRecord().toString()))
+                    .execute();
+        }
+    }
 }
