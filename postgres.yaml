@@ -76,8 +76,9 @@ Resources:
       VpcSecurityGroupIds:
         - !Ref RDSSecurityGroup
       ServerlessV2ScalingConfiguration:
-        MinCapacity: 0.5
+        MinCapacity: 0
         MaxCapacity: 1.0
+        SecondsUntilAutoPause: 300
       AssociatedRoles:
         - FeatureName: Lambda
           RoleArn: !GetAtt RDSLambdaRole.Arn
